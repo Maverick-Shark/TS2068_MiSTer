@@ -1,0 +1,243 @@
+//-------------------------------------------------------------------------------------------------
+// TS2068 para MiSTer (copiado de ZXP3_MiSTer) - reproductor TZX/TAP/PZX con el fichero en la DDR3 del HPS.
+// Equivalente al tzx.v de Kyp (que usa BRAM), pero en MiSTer no hay BRAM para un TZX de cientos
+// de KB, así que la cinta va a la DDR3 (zona del core, a partir de 0x30000000) y se lee byte a
+// byte con una caché de una palabra de 64 bits. El protocolo req/ack de tzxplayer permite esperar
+// a que llegue el dato, así que la latencia de la DDR3 no afecta.
+//
+// Además: bucles de la cinta (0x24/0x25), el bloque 0x2A solo para la cinta si stop48 = 1, y
+// ficheros TAP: si el fichero no empieza por "ZXTape!", se le entrega a tzxplayer un TZX
+// equivalente generado al vuelo (cabecera y un bloque 0x10 con 1 s de pausa por cada bloque).
+//-------------------------------------------------------------------------------------------------
+module tape_ddr
+#(
+	parameter MS = 56000,               // ciclos de ce por milisegundo
+	parameter TS = 16                   // ciclos de reloj por T-estado (reproductor PZX)
+)
+(
+	input  wire        clock,
+	input  wire        ce,              // habilita el reloj de tzxplayer
+
+	// carga del fichero (hps_io)
+	input  wire        dl,              // descarga del TZX en curso
+	input  wire [26:0] dlA,
+	input  wire [ 7:0] dlD,
+	input  wire        dlW,
+	output reg         dlWait,
+
+	// control
+	input  wire        play,            // pulso o nivel, activo a nivel alto
+	input  wire        stop,            // pulso o nivel, activo a nivel alto
+	input  wire        stop48,          // 1: el bloque 0x2A ("parar si es un 48K") para la cinta
+	output wire        busy,            // cinta en marcha
+	output wire        tape,            // señal EAR
+
+	// DDR3
+	output wire        DDRAM_CLK,
+	input  wire        DDRAM_BUSY,
+	output wire [ 7:0] DDRAM_BURSTCNT,
+	output wire [28:0] DDRAM_ADDR,
+	input  wire [63:0] DDRAM_DOUT,
+	input  wire        DDRAM_DOUT_READY,
+	output wire        DDRAM_RD,
+	output wire [63:0] DDRAM_DIN,
+	output wire [ 7:0] DDRAM_BE,
+	output wire        DDRAM_WE
+);
+//--- ddram ---------------------------------------------------------------------------------------
+
+	reg [27:3] ramA;
+	reg [63:0] ramD;
+	reg [ 7:0] ramBE;
+	reg        ramWE = 1'b0;
+	reg        ramRD = 1'b0;
+
+	assign DDRAM_CLK      = clock;
+	assign DDRAM_BURSTCNT = 8'd1;
+	assign DDRAM_ADDR     = { 4'b0011, ramA };
+	assign DDRAM_DIN      = ramD;
+	assign DDRAM_BE       = ramBE;
+	assign DDRAM_WE       = ramWE;
+	assign DDRAM_RD       = ramRD;
+
+	reg [27:0] size = 1'd0;     // bytes cargados
+	reg [27:0] a = 1'd0;        // byte que toca leer
+
+	reg [27:3] cacheA;
+	reg [63:0] cacheD;
+	reg        cacheV = 1'b0;
+	reg        reading = 1'b0;
+
+	// dirección que se sirve: la del TZX/TAP o la del reproductor PZX
+	wire[21:0] pzxA;
+	wire [27:0] ra = isPzx ? { 6'd0, pzxA } : a;
+	wire       hit = cacheV && cacheA == ra[27:3];
+
+	// cabecera TZX: "ZXTape!" + 0x1A + versión 1.20
+	function [7:0] tzxHdr(input [3:0] i);
+		case(i)
+			0: tzxHdr = "Z"; 1: tzxHdr = "X"; 2: tzxHdr = "T"; 3: tzxHdr = "a"; 4: tzxHdr = "p";
+			5: tzxHdr = "e"; 6: tzxHdr = "!"; 7: tzxHdr = 8'h1A; 8: tzxHdr = 8'h01; default: tzxHdr = 8'h14;
+		endcase
+	endfunction
+
+	function [7:0] pzxHdr(input [1:0] i);
+		case(i) 0: pzxHdr = "P"; 1: pzxHdr = "Z"; 2: pzxHdr = "X"; default: pzxHdr = "T"; endcase
+	endfunction
+
+	// formato: TZX si los 8 primeros bytes son la firma, PZX si los 4 primeros son "PZXT", TAP en
+	// otro caso
+	reg dlP = 1'b0, sigOk = 1'b0, pzxOk = 1'b0;
+	always @(posedge clock) begin
+		dlP <= dl;
+		if(dl && !dlP) begin sigOk <= 1'b1; pzxOk <= 1'b1; end
+		else begin
+			if(dlW && dl && dlA < 8 && dlD != tzxHdr(dlA[3:0])) sigOk <= 1'b0;
+			if(dlW && dl && dlA < 4 && dlD != pzxHdr(dlA[1:0])) pzxOk <= 1'b0;
+			if(!dl && dlP && size < 8) sigOk <= 1'b0;
+			if(!dl && dlP && size < 4) pzxOk <= 1'b0;
+		end
+	end
+	wire isPzx = pzxOk;
+	wire isTap = !sigOk && !pzxOk;
+	wire [7:0] q = cacheD[{ ra[2:0], 3'b000 } +: 8];
+
+	always @(posedge clock) begin
+		if(!DDRAM_BUSY) begin
+			if(ramWE) dlWait <= 1'b0;
+			ramWE <= 1'b0;
+			ramRD <= 1'b0;
+		end
+
+		if(dl) begin
+			cacheV <= 1'b0;
+			if(dlW) begin
+				ramA   <= { 1'b0, dlA[26:3] };
+				ramD   <= {8{ dlD }};
+				ramBE  <= 8'd1 << dlA[2:0];
+				ramWE  <= 1'b1;
+				dlWait <= 1'b1;
+				size   <= { 1'b0, dlA } + 1'd1;
+			end
+		end
+		else if(!ramWE && !ramRD && !reading && !hit) begin
+			ramA    <= ra[27:3];
+			cacheA  <= ra[27:3];
+			cacheV  <= 1'b0;
+			ramRD   <= 1'b1;
+			reading <= 1'b1;
+		end
+
+		if(reading && DDRAM_DOUT_READY) begin
+			cacheD  <= DDRAM_DOUT;
+			cacheV  <= 1'b1;
+			reading <= 1'b0;
+		end
+	end
+
+//--- tzx -----------------------------------------------------------------------------------------
+
+	wire       req;
+	reg        ack = 1'b0;
+	reg        motor = 1'b0;
+	reg        restart = 1'b0;
+	reg  [7:0] data;
+	reg        fetch = 1'b0;
+	wire       eot;
+	wire       eot48;
+	wire       loopStart, loopNext;
+	reg [27:0] loopA = 1'd0;
+
+	// TAP: generador del TZX equivalente
+	localparam [2:0] sHDR = 3'd0, sID = 3'd1, sP0 = 3'd2, sP1 = 3'd3, sLEN0 = 3'd4, sLEN1 = 3'd5, sDATA = 3'd6;
+	reg  [2:0] tapSt = sHDR;
+	reg  [3:0] tapHi = 4'd0;
+	reg [15:0] tapLen = 16'd0;
+
+	always @(posedge clock) begin
+		restart <= 1'b0;
+
+		if(play && !dl && !isPzx) begin
+			a <= 1'd0;
+			fetch <= 1'b0;
+			tapSt <= sHDR;
+			tapHi <= 4'd0;
+			motor <= 1'b1;
+			restart <= 1'b1;
+		end
+		else if(stop || eot || (eot48 && stop48) || dl || isPzx || (isTap ? (tapSt == sID && a >= size) : a >= size)) motor <= 1'b0;
+		else if(loopStart) loopA <= a;
+		else if(loopNext)  a <= loopA;
+		else if(req != ack && !fetch && isTap && tapSt <= sP1) begin
+			// TAP: bytes que no están en el fichero (cabecera TZX, ID 0x10 y pausa de 1000 ms)
+			ack <= req;
+			case(tapSt)
+				sHDR: begin data <= tzxHdr(tapHi); tapHi <= tapHi+1'd1; if(tapHi == 9) tapSt <= sID; end
+				sID:  begin data <= 8'h10; tapSt <= sP0; end
+				sP0:  begin data <= 8'hE8; tapSt <= sP1; end
+				default: begin data <= 8'h03; tapSt <= sLEN0; end
+			endcase
+		end
+		else if(req != ack && !fetch) fetch <= 1'b1;
+		else if(fetch && hit) begin
+			data  <= q;
+			ack   <= req;
+			a     <= a+1'd1;
+			fetch <= 1'b0;
+			// TAP: longitud del bloque (2 bytes) y datos
+			case(tapSt)
+				sLEN0: begin tapLen[7:0] <= q; tapSt <= sLEN1; end
+				sLEN1: begin tapLen[15:8] <= q; tapSt <= (tapLen[7:0] == 0 && q == 0) ? sID : sDATA; end
+				sDATA: begin tapLen <= tapLen-1'd1; if(tapLen == 1) tapSt <= sID; end
+				default: ;
+			endcase
+		end
+	end
+
+	tzxplayer #(.TZX_MS(MS)) tzxplayer
+	(
+		.clk         (clock  ),
+		.ce          (ce     ),
+		.tzx_ack     (ack    ),
+		.tzx_req     (req    ),
+		.host_tap_in (data   ),
+		.cass_motor  (motor  ),
+		.restart_tape(restart),
+		.loop_start  (loopStart),
+		.loop_next   (loopNext ),
+		.stop        (eot    ),
+		.stop48k     (eot48  ),
+		.cass_read   (tzxTape),
+		.cass_running(tzxBusy)
+	);
+
+//--- pzx -----------------------------------------------------------------------------------------
+
+	wire       tzxTape, tzxBusy;
+	wire       pzxReq, pzxBusy, pzxTape;
+	reg        pzxAck = 1'b0;
+	reg  [7:0] pzxQ;
+
+	always @(posedge clock) if(isPzx && pzxReq != pzxAck && hit && !dl) begin pzxQ <= q; pzxAck <= pzxReq; end
+
+	pzx_player #(.TS(TS)) pzx_player
+	(
+		.clock (clock               ),
+		.play  (play && !dl && isPzx),
+		.stop  (stop || dl          ),
+		.stop48(stop48              ),
+		.size  (size[21:0]          ),
+		.busy  (pzxBusy             ),
+		.tape  (pzxTape             ),
+		.mReq  (pzxReq              ),
+		.mAck  (pzxAck              ),
+		.mA    (pzxA                ),
+		.mQ    (pzxQ                )
+	);
+
+	assign busy = isPzx ? pzxBusy : tzxBusy;
+	assign tape = isPzx ? pzxTape : tzxTape;
+
+//-------------------------------------------------------------------------------------------------
+endmodule
+//-------------------------------------------------------------------------------------------------

@@ -1,0 +1,3 @@
+[submodule "rtl/ts2068"]
+	path = rtl/ts2068
+	url = https://github.com/Kyp069/ts2068.git

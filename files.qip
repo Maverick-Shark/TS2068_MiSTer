@@ -1,0 +1,29 @@
+# Timex Sinclair 2068 para MiSTer
+#
+# rtl/ts2068: core de Kyp (submodulo Kyp069/ts2068, sin cambios). No se usan mist.v, i2s.v,
+# scandoubler.v, tzx.v ni tzxplayer.vhd del core (de eso se encarga el marco de MiSTer), ni las
+# carpetas psd/, npp/ y mist/ (placas Poseidon y Neptuno+ y marco de MiST).
+
+set_global_assignment -name QIP_FILE           rtl/ts2068/T80/T80.qip
+set_global_assignment -name VERILOG_FILE       rtl/ts2068/core/cpu.v
+set_global_assignment -name VERILOG_FILE       rtl/ts2068/core/dpr.v
+set_global_assignment -name VERILOG_FILE       rtl/ts2068/core/ram.v
+set_global_assignment -name VERILOG_FILE       rtl/ts2068/core/rom.v
+set_global_assignment -name VERILOG_FILE       rtl/ts2068/core/mapper.v
+set_global_assignment -name VERILOG_FILE       rtl/ts2068/core/matrix.v
+set_global_assignment -name VERILOG_FILE       rtl/ts2068/core/ps2k.v
+set_global_assignment -name VERILOG_FILE       rtl/ts2068/core/psg.v
+set_global_assignment -name VERILOG_FILE       rtl/ts2068/core/sdc.v
+set_global_assignment -name VERILOG_FILE       rtl/ts2068/core/spi.v
+set_global_assignment -name VERILOG_FILE       rtl/ts2068/core/vdu.v
+set_global_assignment -name VERILOG_FILE       rtl/ts2068/core/ts.v
+
+set_global_assignment -name QIP_FILE           rtl/pll.qip
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/pll_timing.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/dck_loader.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/tape_ddr.sv
+set_global_assignment -name VHDL_FILE          rtl/tzxplayer.vhd
+set_global_assignment -name VERILOG_FILE       rtl/pzx_player.v
+
+set_global_assignment -name SDC_FILE           TS2068.sdc
+set_global_assignment -name SYSTEMVERILOG_FILE TS2068.sv
